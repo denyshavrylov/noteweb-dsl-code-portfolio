@@ -1,0 +1,56 @@
+- hosts: 127.0.0.1
+  vars:
+    SECRET_DATA: "{{ lookup('hashi_vault', 'secret={{ NW_VAULT_AWS_ACCESS_KEY_PATH | replace(\"cubbyhole\", \"cubbyhole/data\") }} url={{ NW_VAULT_URL }} token={{ NW_VAULT_TOKEN }}')  }}"
+    vault:
+      REPO_PWD: "{{ 'store_in_vault_pass' }}"
+      REPO_USER: store_in_vault_user
+  tasks:
+    - name: Find files ending with the search string
+      find:
+        paths: "{{ work_dir }}"
+        patterns: '*{{ item }}'
+        recurse: yes
+      with_items:
+        - generate-container.yml
+        - CRUD.yml
+        - CRUD-index-python.yml
+        - CRUD-index-nodejs.yml
+        - angular-app.yml
+        - _container_service.yml
+      register: files_to_delete
+
+#    - name: Log identified files for deletion of generation logic
+#      debug:
+#        msg: "{{ files_to_delete }}"
+
+    - name: Ensure the gen files are not committed service-templates/lambda/java/CRUD.yml, python - CRUD-index-python, angular-app/angular-app - separating build+deploy
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      with_items: "{{ files_to_delete.results | json_query('[].files[]') }}"
+      when: files_to_delete.results
+
+    - name: create .gitignore file
+      shell: |+
+        cd "{{ work_dir }}"
+        echo "node_modules/" > .gitignore
+        echo "target/" >> .gitignore
+        echo "build/" >> .gitignore
+        echo "*.zip" >> .gitignore
+
+    - name: create git repo of current directory with deployment scripts, import, push to the target (non-template) git repo
+      shell: |+
+        cd "{{ work_dir }}"
+        git init  
+        git config user.email "{{ user_email }}"
+        git config user.name "{{ user_full_name }}"
+        git add .  
+        git commit -m "Initial code import for NW context {{ context_name }} (by Note Web PaaS DSL)"  
+        git remote add origin "{{ git_repo }}"
+        git branch -m "{{ git_version }}"
+        git -c http.sslVerify=false push origin -u "{{ git_version }}"
+      register: git_repo_setup
+
+    - name: log git create repo output
+      ansible.builtin.debug:
+        msg: "git_repo_setup: {{ git_repo_setup }}"

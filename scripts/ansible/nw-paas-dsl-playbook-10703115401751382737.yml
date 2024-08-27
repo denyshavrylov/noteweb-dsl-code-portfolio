@@ -1,0 +1,460 @@
+- hosts: 127.0.0.1
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    SECRET_DATA: "{{ lookup('hashi_vault', 'secret={{ NW_VAULT_AWS_ACCESS_KEY_PATH | replace(\"cubbyhole\", \"cubbyhole/data\") }} url={{ NW_VAULT_URL }} token={{ NW_VAULT_TOKEN }}')  }}"
+    vault:
+      REPO_PWD: "{{ 'store_in_vault_pass' }}"
+      REPO_USER: store_in_vault_user
+      AWS_ACCESS_KEY: "{{ SECRET_DATA.data.accessKeyId }}"
+      AWS_SECRET_KEY: "{{ SECRET_DATA.data.secretKey }}"
+      AWS_REGION: "{{ AWS_REGION }}"
+
+  tasks:
+    - name: Ensure Python3 pip package is installed
+      shell: "yum install -y python3-pip"
+
+    - name: Install AWS CLI using pip3
+      pip:
+        name: awscli
+        executable: pip3
+
+#    - name: Install AWS CLI v2
+#      shell: |
+#        curl "https://d1vvhvl2y92vvt.cloudfront.net/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+#        unzip awscliv2.zip
+#        sudo ./aws/install
+#      args:
+#        executable: /bin/bash
+#      environment:
+#        PATH: "{{ ansible_env.PATH }}:/usr/local/bin"  # Ensure the AWS CLI is in the system's PATH
+#      become: yes
+
+
+    - name: Get AWS account information
+      amazon.aws.aws_caller_info:
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+      register: account_info
+
+    - name: Display AWS account ID
+      debug:
+        var: account_info
+
+    - name: Get default VPC details
+      amazon.aws.ec2_vpc_net_info:
+        region: "{{ AWS_REGION }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        filters:
+          isDefault: "true"
+      register: default_vpc_info
+
+    - name: Display default VPC details
+      debug:
+        var: default_vpc_info
+
+    - name: Get security group details
+      amazon.aws.ec2_group_info:
+        region: "{{ AWS_REGION }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        filters:
+          "vpc-id": "{{ default_vpc_info.vpcs[0].id }}"
+      register: default_sg_info
+
+    - name: Display default security group info
+      debug:
+        msg: "{{ default_sg_info }}"
+
+    - name: Store comma separated list of security group ids
+      set_fact:
+        default_sgs: "{{ default_sg_info.security_groups | map(attribute='group_id') | list }}"
+
+    - name: Display default security group ids
+      debug:
+        msg: "{{ default_sgs }}"
+
+    - name: Get subnet details of default VPC
+      amazon.aws.ec2_vpc_subnet_info:
+        region: "{{ AWS_REGION }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        filters:
+          "vpc-id": "{{ default_vpc_info.vpcs[0].id }}"
+      register: default_subnet_info
+
+    - name: Store comma separated list of subnet ids
+      set_fact:
+        default_subnets: "{{ default_subnet_info.subnets | map(attribute='id') | list }}"
+
+    - name: Display IDs of subnets
+      debug:
+        msg: "{{ default_subnet_info.subnets | map(attribute='id') | list }}"
+
+
+
+
+
+    # default_role create -> { default_role assumes for lambdas, ecs, eks } -> { resource policies for each particular resource }
+    - name: Create default NW context IAM Role to allow data plane operations for solution resources
+      iam_role:
+        name: "{{ context_role_name }}"
+        description: "NW context {{ context_role_name }} IAM role"
+        region: "{{ AWS_REGION }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        managed_policies:
+          - AmazonAPIGatewayPushToCloudWatchLogs
+        assume_role_policy_document:
+          Version: '2012-10-17'
+          Statement:
+            - Action: sts:AssumeRole
+              Effect: Allow
+              Principal:
+                Service:
+                  - ec2.amazonaws.com
+                  - eks.amazonaws.com
+                  - ecs.amazonaws.com
+                  - lambda.amazonaws.com
+                  - apigateway.amazonaws.com
+              Sid: Assume{{ context_role_name | regex_replace('[^a-zA-Z0-9_]', '') }}Policy
+      register: default_context_role
+
+    # {
+    #    "Version": "2012-10-17",
+    #    "Statement": [
+    #        {
+    #            "Sid": "AllowLogWrite",
+    #            "Effect": "Allow",
+    #            "Action": [
+    #                "logs:CreateLogGroup",
+    #                "logs:CreateLogStream",
+    #                "logs:PutLogEvents"
+    #            ],
+    #            "Resource": "arn:aws:logs:*:*:*"
+    #        }
+    #    ]
+    #}
+    - name: Get HashiCorp Vault crmdb secret
+      set_fact:
+        crmdb_secret_data: "{{ lookup('hashi_vault', 'secret={{ NW_VAULT_AWS_ACCESS_KEY_PATH | replace(\"cubbyhole\", \"cubbyhole/data\") | replace(\"/access\", \"/crmdb_database_username\") }} url={{ NW_VAULT_URL }} token={{ NW_VAULT_TOKEN }}') }}"
+      ignore_errors: yes
+
+    - name: Update Ansible variable if secret exists
+      set_fact:
+        crmdb_actual_password: "{{ crmdb_secret_data.password }}"
+      when: crmdb_secret_data is defined
+      ignore_errors: yes
+
+    - name: Update HashiCorp Vault crmdb_database_username value
+      community.hashi_vault.vault_write:
+        url: "{{ NW_VAULT_URL }}"
+        token: "{{ NW_VAULT_TOKEN }}"
+        path: "{{ NW_VAULT_AWS_ACCESS_KEY_PATH | replace(\"cubbyhole\", \"cubbyhole/data\") | replace(\"/access\", \"/crmdb_database_username\") }}"
+        data:
+          password: "{{ crmdb_database_password }}"
+      when: crmdb_secret_data is not defined
+
+    - name: Update Ansible variable if no secret in vault
+      set_fact:
+        crmdb_actual_password: "{{ crmdb_database_password }}"
+      when: crmdb_secret_data is not defined
+      ignore_errors: yes
+
+    - name: Update security group inbound rules
+      ec2_group:
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+        name: "{{ context_name }}_mysql_sg"
+        description: "Security group for serverlesscustomerproductmanagement mysql instances"
+        rules:
+          - proto: "tcp"
+            from_port: "3306"
+            to_port: "3306"
+            cidr_ip: "0.0.0.0/0"
+            rule_desc: Allow MySQL traffic from the internet
+        state: present
+      register: "serverlesscustomerproductmanagement_mysql_sg_id"
+
+    - name: log {{ context_name }} mysql instances security group info
+      debug:
+        msg: "{{ context_name }} mysql instances ({{ crmdb_database_username }}/{{ crmdb_actual_password }}) security group info: {{ serverlesscustomerproductmanagement_mysql_sg_id }}"
+
+    - name: create minimal mysql instance in default VPC and default subnet group
+      community.aws.rds_instance:
+        engine: mysql
+        db_instance_identifier: "{{ crmdb_instance_name | lower }}"
+        instance_type: db.t3.micro
+        allocated_storage: 9
+        password: "{{ crmdb_actual_password }}"
+        username: "{{ crmdb_database_username }}"
+        db_name: "{{ crmdb_default_database | lower }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+        vpc_security_group_ids: "{{ serverlesscustomerproductmanagement_mysql_sg_id.group_id }}"
+      register: "crmdb_new_db_instance"
+
+    - name: register new_db_instance in the dictionary of new_cloud_elements
+      set_fact:
+        new_cloud_elements: "{{ new_cloud_elements | default({}) | combine({ 'crmdb_instance_name' : crmdb_new_db_instance }) }}"
+
+    - name: log new_cloud_elements
+      debug:
+        msg: "new_cloud_elements={{ new_cloud_elements }}"
+
+    - name: Wait for security group status and pending parameter changes
+      community.aws.rds_instance_info:
+        db_instance_identifier: "{{ crmdb_instance_name | lower }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+      register: rds_instance_info
+      until: >
+        rds_instance_info.instances[0].vpc_security_groups[0].status == 'active' and 
+          (rds_instance_info.instances[0].pending_modified_values | length == 0) and 
+          (rds_instance_info.instances[0].db_instance_status == 'available')
+      retries: 15
+      delay: 15
+
+    - name: Wait for password changes to get applied
+      community.mysql.mysql_query:
+        login_db: "{{ crmdb_default_database | lower }}"
+        login_host: "{{ new_cloud_elements['crmdb_instance_name'].endpoint.address }}"
+        login_user: "{{ crmdb_database_username }}"
+        login_password: "{{ crmdb_actual_password }}"
+        login_port: "{{ new_cloud_elements['crmdb_instance_name'].endpoint.port }}"
+        query: "select version() "
+      register: mysql_version_result
+      ignore_errors: yes
+      until: mysql_version_result.failed == false
+      retries: 15
+      delay: 15
+
+
+    - name: log latest crmdb status
+      debug:
+        msg: "{{ rds_instance_info }}"
+    # no grants to NW_Context context_role_name required to CRUD on mysql tables
+
+    - name: Install PyMySQL
+      pip:
+        name: pymysql
+        state: present
+
+    - name: Log mysql tables of current db instance
+      debug:
+        msg: "Accessing with {{ crmdb_database_username }}/{{ crmdb_database_password }}: {{ table_entities | selectattr('type', 'equalto', 'mysql') | selectattr('container_id', 'equalto', 'crmdb') | list }}"
+
+    # TODO is liquibase suited better for this task?
+    - name: Drop MySQL table(s)
+      community.mysql.mysql_query:
+        login_db: "{{ crmdb_default_database | lower }}"
+        login_host: "{{ new_cloud_elements['crmdb_instance_name'].endpoint.address }}"
+        login_user: "{{ crmdb_database_username }}"
+        login_password: "{{ crmdb_actual_password }}"
+        login_port: "{{ new_cloud_elements['crmdb_instance_name'].endpoint.port }}"
+        query: "drop table if exists {{ item.name | lower }} "
+      loop: "{{ table_entities | selectattr('type', 'equalto', 'mysql') | selectattr('container_id', 'equalto', 'crmdb') | list }}"
+
+    - name: Create MySQL table
+      community.mysql.mysql_query:
+        login_db:   "{{ crmdb_default_database | lower }}"
+        login_host: "{{ new_cloud_elements['crmdb_instance_name'].endpoint.address }}"
+        login_user: "{{ crmdb_database_username }}"
+        login_password: "{{ crmdb_actual_password }}"
+        login_port: "{{ new_cloud_elements['crmdb_instance_name'].endpoint.port }}"
+        query: "create table {{ item.name | lower }} ( {% for field in item.fields %} {{field.name}} {{field.type}} {% if field.id is defined %} primary key {% endif %} {% if field.generated is defined %} auto_increment {% endif %} {%if not field.last %},{%endif%}{% endfor %} )"
+      loop: "{{ table_entities | selectattr('type', 'equalto', 'mysql') | selectattr('container_id', 'equalto', 'crmdb') | list }}"
+
+      # ansible shell approach requires mysql client to be installed on NW PaaS DSL Service host
+    - name: Create dynamo table with hash and range primary key
+      # TODO consider enabling dynamodb streams if synchro scenarios needed
+      community.aws.dynamodb_table:
+        name: "{{ item.name }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+        hash_key_name: "{% for field in item.fields %}{% if field.id is defined %}{{ field.name }}{% endif %}{% endfor %}"
+        hash_key_type: STRING
+        #range_key_name: create_time
+        #range_key_type: NUMBER
+        #read_capacity: 2
+        #write_capacity: 2
+        tags: "{{ dynamodb_tags | default(omit) }}"
+      loop: "{{ table_entities | selectattr('type', 'equalto', 'dynamodb') | list }}"
+
+    - name: Log policy Resource value
+      debug:
+        var: "{{ table_entities | selectattr('type', 'equalto', 'dynamodb') | map(attribute='name') | map('regex_replace', '^(.*)$', 'arn:aws:dynamodb:{{ vault.AWS_REGION }}:{{ account_info.account }}:table/\\1') | list | join(', ') }}"
+
+    - name: Attach DynamoDB CRUD policy to the NW Context default IAM role
+      iam_policy:
+        iam_type: role
+        iam_name: "{{ context_role_name }}"
+        policy_name: "{{ context_name }}DynamoDBCRUDPolicy" # TODO might crash if dynamodb tables defined in multiple resources
+        policy_json:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - "dynamodb:PutItem"
+                - "dynamodb:GetItem"
+                - "dynamodb:UpdateItem"
+                - "dynamodb:DeleteItem"
+                - "dynamodb:BatchWriteItem"
+                - "dynamodb:BatchGetItem"
+                - "dynamodb:Query"
+                - "dynamodb:Scan"
+              #Resource: "{{ table_entities | selectattr('type', 'equalto', 'dynamodb') | map(attribute='name') | map('regex_replace', '^(.*)$', 'arn:aws:dynamodb:{{ vault.AWS_REGION }}:{{ account_info.account }}:table/\\1') | list | join(', ') }}"
+              Resource: "arn:aws:dynamodb:eu-west-1:408636733530:table/*"
+        state: present
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+
+    - name: run tasks to build lambda
+      include_tasks: "{{ playbook_dir }}/templates/lambda-nodejs/customerlambda_CRUD-index-nodejs.yml"
+      vars:
+        work_dir: "{{ work_dir }}"
+        lambda_id: "customerlambda"
+        source_db: "{{ customerlambda_lambda_source_db }}"
+        database_type: "{{ customerlambda_database_type }}"
+#        database_name: "{{ customerlambda_database_name }}"
+#        database_user: "{{ customerlambda_database_user }}"
+#        database_pass: "{{ customerlambda_database_pass }}"
+#        database_host: "{{ customerlambda_database_host }}"
+
+
+#    - name: Ensure lambda layer work directory exists
+#      file:
+#        path: "{{ lambda_work_dir }}/lambda_layer/nodejs"
+#        state: directory
+#        recurse: yes
+#
+#    - name: Copy node_modules to lambda layer directory
+#      command: "cp -r {{ lambda_work_dir }}/node_modules {{ lambda_work_dir }}/lambda_layer/nodejs/"
+#
+#    - name: Package AWS Lambda layer (node_modules directory)
+#      command: "zip -r lambda_layer.zip ."
+#      args:
+#        chdir: "{{ lambda_work_dir }}/lambda_layer"
+#
+#    - name: Create AWS Lambda Layer using AWS CLI
+#      shell: >
+#        aws lambda publish-layer-version
+#        --layer-name customerlambda_libs_layer
+#        --zip-file fileb://{{ lambda_work_dir }}/lambda_layer.zip
+#        --compatible-runtimes nodejs16.x
+#      environment:
+#        AWS_DEFAULT_REGION: "{{ vault.AWS_REGION }}"
+#        AWS_ACCESS_KEY_ID: "{{ vault.AWS_ACCESS_KEY }}"
+#        AWS_SECRET_ACCESS_KEY: "{{ vault.AWS_SECRET_KEY }}"
+#      register: lambda_layer_output
+#
+#    - name: Set fact for Lambda Layer ARN
+#      set_fact:
+#        customerlambda_lambda_layer: "{{ (lambda_layer_output.stdout | from_json).LayerVersionArn }}"
+#
+#    - name: Log lambda layer details
+#      debug:
+#        msg: "Lambda layer ARN: {{ customerlambda_lambda_layer }} RAW LAYER OUTPUT: {{ lambda_layer_output }}"
+#
+#    - name: Package main AWS Lambda code (src directory)
+#      command: "zip -r ../noteweb-nodejs-aws-lambda.zip ."
+#      args:
+#        chdir: "{{ lambda_work_dir }}/src/"
+
+    - name: create nodejs lambda per zip-file
+      community.aws.lambda:
+        name: "{{ customerlambda_lambda_name }}"
+        state: present
+        zip_file: '{{ customerlambda_lambda_zip_file }}'
+        runtime: 'nodejs16.x'
+        role: '{{ customerlambda_lambda_role }}'
+        handler: 'dist/index.handler'
+        timeout: 5
+        memory_size: 196
+        #vpc_subnet_ids: "{{ customerlambda_lambda_subnet_ids }}"
+        #vpc_security_group_ids: "{{ customerlambda_lambda_security_group_ids }}"
+        environment_variables: '{{ customerlambda_lambda_env_vars }}'
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+        tags: "{{ customerlambda_lambda_tags }}"
+        #layers:
+        #  - layer_version_arn: "{{ customerlambda_lambda_layer }}"
+
+    - name: run tasks to build lambda
+      include_tasks: "{{ playbook_dir }}/templates/lambda-nodejs/productlambda_CRUD-index-nodejs.yml"
+      vars:
+        work_dir: "{{ work_dir }}"
+        lambda_id: "productlambda"
+        source_db: "{{ productlambda_lambda_source_db }}"
+        database_type: "{{ productlambda_database_type }}"
+#        database_name: "{{ productlambda_database_name }}"
+#        database_user: "{{ productlambda_database_user }}"
+#        database_pass: "{{ productlambda_database_pass }}"
+#        database_host: "{{ productlambda_database_host }}"
+
+
+#    - name: Ensure lambda layer work directory exists
+#      file:
+#        path: "{{ lambda_work_dir }}/lambda_layer/nodejs"
+#        state: directory
+#        recurse: yes
+#
+#    - name: Copy node_modules to lambda layer directory
+#      command: "cp -r {{ lambda_work_dir }}/node_modules {{ lambda_work_dir }}/lambda_layer/nodejs/"
+#
+#    - name: Package AWS Lambda layer (node_modules directory)
+#      command: "zip -r lambda_layer.zip ."
+#      args:
+#        chdir: "{{ lambda_work_dir }}/lambda_layer"
+#
+#    - name: Create AWS Lambda Layer using AWS CLI
+#      shell: >
+#        aws lambda publish-layer-version
+#        --layer-name productlambda_libs_layer
+#        --zip-file fileb://{{ lambda_work_dir }}/lambda_layer.zip
+#        --compatible-runtimes nodejs16.x
+#      environment:
+#        AWS_DEFAULT_REGION: "{{ vault.AWS_REGION }}"
+#        AWS_ACCESS_KEY_ID: "{{ vault.AWS_ACCESS_KEY }}"
+#        AWS_SECRET_ACCESS_KEY: "{{ vault.AWS_SECRET_KEY }}"
+#      register: lambda_layer_output
+#
+#    - name: Set fact for Lambda Layer ARN
+#      set_fact:
+#        productlambda_lambda_layer: "{{ (lambda_layer_output.stdout | from_json).LayerVersionArn }}"
+#
+#    - name: Log lambda layer details
+#      debug:
+#        msg: "Lambda layer ARN: {{ productlambda_lambda_layer }} RAW LAYER OUTPUT: {{ lambda_layer_output }}"
+#
+#    - name: Package main AWS Lambda code (src directory)
+#      command: "zip -r ../noteweb-nodejs-aws-lambda.zip ."
+#      args:
+#        chdir: "{{ lambda_work_dir }}/src/"
+
+    - name: create nodejs lambda per zip-file
+      community.aws.lambda:
+        name: "{{ productlambda_lambda_name }}"
+        state: present
+        zip_file: '{{ productlambda_lambda_zip_file }}'
+        runtime: 'nodejs16.x'
+        role: '{{ productlambda_lambda_role }}'
+        handler: 'dist/index.handler'
+        timeout: 5
+        memory_size: 196
+        #vpc_subnet_ids: "{{ productlambda_lambda_subnet_ids }}"
+        #vpc_security_group_ids: "{{ productlambda_lambda_security_group_ids }}"
+        environment_variables: '{{ productlambda_lambda_env_vars }}'
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+        tags: "{{ productlambda_lambda_tags }}"
+        #layers:
+        #  - layer_version_arn: "{{ productlambda_lambda_layer }}"
+
