@@ -1,0 +1,23 @@
+- hosts: 127.0.0.1
+  vars:
+    SECRET_DATA: "{{ lookup('hashi_vault', 'secret={{ NW_VAULT_AWS_ACCESS_KEY_PATH | replace(\"cubbyhole\", \"cubbyhole/data\") }} url={{ NW_VAULT_URL }} token={{ NW_VAULT_TOKEN }}')  }}"
+    vault:
+      REPO_PWD: store_in_vault_pass
+      REPO_USER: store_in_vault_user
+  tasks:    
+    - name: create git repo of current directory with deployment scripts, import, push to the target (non-template) git repo
+      shell: |+
+        cd "{{ work_dir }}"
+        git init  
+        git config user.email "{{ user_email }}"
+        git config user.name "{{ user_full_name }}"
+        git add .  
+        git commit -m "Initial code import for NW context {{ context_name }} (by Note Web PaaS DSL)"  
+        git remote add origin "{{git_repo}}"
+        git branch -m "{{git_version}}"
+        git -c http.sslVerify=false push origin -u "{{git_version}}"
+      register: git_repo_setup
+
+    - name: log git create repo output
+      ansible.builtin.debug:
+        msg: "git_repo_setup: {{ git_repo_setup }}"

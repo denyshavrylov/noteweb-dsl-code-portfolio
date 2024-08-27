@@ -1,0 +1,329 @@
+
+    - name: set work directory, main app class
+      set_fact:
+        lambda_work_dir: "{{ work_dir }}/CustomerCRUD_lambda"
+        PACKAGE_DIR: "src/main/java/{{ CustomerCRUD_lambda_package | replace('.', '/') }}"
+        main_class: "{% for entity in entities.CustomerCRUD %}{{ entity.class }}{% endfor %}CrudAwsLambdaApplication"
+
+    - name: setup src directories
+      shell: | 
+              mkdir -p  {{ lambda_work_dir }}  
+              cd {{ lambda_work_dir }} 
+              mkdir -p scripts/nwpaasdsl src/assembly src/shell/native src/main/resources/META-INF/native-image
+              mkdir -p {{ PACKAGE_DIR }}
+              cd {{ PACKAGE_DIR }}
+              mkdir -p model controller exception repository function
+
+    - name: generate pom.xml
+      copy:
+        src: "{{ playbook_dir }}/pom.xml"
+        dest: "{{ lambda_work_dir }}/pom.xml"
+
+    - name: generate assembly-native.xml
+      copy:
+        src: "{{ playbook_dir }}/assembly-native.xml"
+        dest: "{{ lambda_work_dir }}/src/assembly/native.xml"
+
+    - name: Generate model classes by supplied entities.CustomerCRUD
+      copy:
+        dest: "{{ lambda_work_dir }}/{{ PACKAGE_DIR }}/model/{{ entity.class }}.java"
+        content: |
+          package {{ CustomerCRUD_lambda_package }}.model;
+          
+          import javax.persistence.*;
+          import lombok.Data;
+          import lombok.AllArgsConstructor;
+          import lombok.NoArgsConstructor;
+          import com.fasterxml.jackson.annotation.JsonProperty;
+          
+          @NoArgsConstructor
+          @AllArgsConstructor
+          @Data
+          @Entity
+          @Table(name = "{{ entity.class }}")
+          public class {{ entity.class }} {
+            {% for field in entity.fields %}
+              {% if field.id is defined %}@Id{% endif %}
+              {% if field.generated is defined %} @GeneratedValue(strategy = GenerationType.{{ field.generated }}){% endif %}
+            @JsonProperty private {{ field.type }} {{ field.name }};
+            {% endfor %}
+          }
+      loop: "{{ entities.CustomerCRUD }}"
+      loop_control:
+        loop_var: "entity"
+
+    - name: Placeholder model class for response to entities.CustomerCRUD
+      copy:
+        dest: "{{ lambda_work_dir }}/{{ PACKAGE_DIR }}/model/Response.java"
+        content: |
+          package {{ CustomerCRUD_lambda_package }}.model;
+
+          import javax.persistence.*;
+          import lombok.Builder;
+          import lombok.Data;
+          import lombok.AllArgsConstructor;
+          import lombok.NoArgsConstructor;
+          import com.fasterxml.jackson.annotation.JsonProperty;
+          
+          @Data
+          @Builder
+          @NoArgsConstructor
+          @AllArgsConstructor
+          public class Response<T> {
+            @JsonProperty
+            private T payload = null;
+            @JsonProperty
+            private boolean saved = false;
+          }
+
+    - name: Spring AOT native image build config for reflection pre-processing
+      copy:
+        dest: "{{ lambda_work_dir }}/src/main/resources/META-INF/native-image/reflect-config.json"
+        content: |
+          [
+            {
+              "name": "com.mysql.jdbc.Driver",
+              "allDeclaredConstructors": true,
+              "allPublicConstructors": true,
+              "allDeclaredMethods": true,
+              "allPublicMethods": true,
+              "allDeclaredClasses": true,
+              "allPublicClasses": true
+            }
+          ]
+
+    - name: Embedded configuration properties
+      copy:
+        dest: "{{ lambda_work_dir }}/src/main/resources/application.properties"
+        content: |
+          spring.datasource.url=jdbc:mysql://{{ new_cloud_elements[instance_name].endpoint.address }}:{{ new_cloud_elements[instance_name].endpoint.port }}/{{ default_database | lower }}
+          spring.datasource.username={{ database_username }}
+          spring.datasource.password={{ database_password }}
+          spring.datasource.driver-class-name=com.mysql.jdbc.Driver
+          spring.jpa.database-platform=org.hibernate.dialect.MySQL5Dialect
+
+    - name: Generate CrudFunction classes by supplied entities.CustomerCRUD
+      copy:
+        dest: "{{ lambda_work_dir }}/{{ PACKAGE_DIR }}/function/{{ entity.class }}CrudFunctions.java"
+        content: |
+          package {{ CustomerCRUD_lambda_package }}.function;
+          
+          import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
+          import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
+          import {{ CustomerCRUD_lambda_package }}.model.{{ entity.class }};
+          import {{ CustomerCRUD_lambda_package }}.repository.{{ entity.class }}Repository;
+          import {{ CustomerCRUD_lambda_package }}.model.Response;
+          import com.fasterxml.jackson.core.JsonProcessingException;
+          import com.fasterxml.jackson.databind.ObjectMapper;
+          import java.util.function.Function;
+          import java.util.List;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import javax.validation.constraints.NotNull;
+          import lombok.SneakyThrows;
+          import lombok.extern.slf4j.Slf4j;
+          import org.springframework.stereotype.Component;
+          import org.springframework.validation.annotation.Validated;
+          import com.fasterxml.jackson.databind.SerializationFeature;
+          
+          @Component
+          @Slf4j
+          @Validated
+          public class {{ entity.class }}CrudFunctions implements Function<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
+          
+            private final ObjectMapper objectMapper;
+            private final {{ entity.class }}Repository repository;
+            
+            public {{ entity.class }}CrudFunctions(@NotNull final ObjectMapper objectMapper, {{ entity.class }}Repository repository) {
+              this.objectMapper = objectMapper;
+              this.objectMapper.disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
+          
+              this.repository = repository;
+            }
+            
+            /**
+            * Lambda function handler that takes a request and returns a response.
+            *
+            * @param proxyRequestEvent the function argument
+            * @return {@link APIGatewayProxyResponseEvent}
+            * @throws JsonProcessingException
+            */
+            @Override
+            @SneakyThrows(value = JsonProcessingException.class)
+            public APIGatewayProxyResponseEvent apply(final APIGatewayProxyRequestEvent proxyRequestEvent) {
+              APIGatewayProxyResponseEvent proxyResponseEvent = null;
+              log.info("Converting {} request '{}' into a response...", proxyRequestEvent.getHttpMethod(), proxyRequestEvent.getBody());
+              
+              switch (proxyRequestEvent.getHttpMethod()) {
+                case "POST":     proxyResponseEvent = createEntity(proxyRequestEvent);
+                                 break;
+                case "PUT":      proxyResponseEvent = updateEntity(proxyRequestEvent);
+                                 break;
+                case "GET":      proxyResponseEvent = getAllEntities(proxyRequestEvent);
+                                 break;
+                default:   proxyResponseEvent = deleteEntity(proxyRequestEvent);
+                                 break;
+              }
+          
+              log.info("Converted {} request '{}' - response: {}", proxyRequestEvent.getHttpMethod(), proxyRequestEvent.getBody(), proxyResponseEvent);
+              return proxyResponseEvent;
+            }
+          
+            private APIGatewayProxyResponseEvent createEntity(APIGatewayProxyRequestEvent proxyRequestEvent) throws JsonProcessingException {
+              {{ entity.class }}[] request = objectMapper.readValue(proxyRequestEvent.getBody(), {{ entity.class }}[].class);
+              List<{{ entity.class }}> responseContent = new ArrayList<{{ entity.class }}>();
+              for ({{ entity.class }} entry : request) {
+                {{ entity.class }} saved{{ entity.class }} = repository.save(entry);
+                responseContent.add(saved{{ entity.class }});
+              }
+              String responseBody = objectMapper.writeValueAsString(responseContent);
+              return createSuccessResponse(responseBody);
+            }
+              
+            private APIGatewayProxyResponseEvent updateEntity(APIGatewayProxyRequestEvent proxyRequestEvent) throws JsonProcessingException {
+              return createEntity(proxyRequestEvent);
+            }
+              
+            private APIGatewayProxyResponseEvent getAllEntities(APIGatewayProxyRequestEvent proxyRequestEvent) throws JsonProcessingException {
+              List<{{ entity.class }}> {{ entity.class }}s = repository.findAll();
+              String responseBody = objectMapper.writeValueAsString({{ entity.class }}s);
+              return createSuccessResponse(responseBody);
+            }
+              
+            private APIGatewayProxyResponseEvent deleteEntity(APIGatewayProxyRequestEvent proxyRequestEvent) throws JsonProcessingException {
+              List<{{ entity.id_type }}> deletedIds = extractIdFromRequest(proxyRequestEvent);
+              deletedIds.forEach(id -> repository.deleteById( id ));
+              return createSuccessResponse();
+            }
+              
+              // Helper methods
+              
+            private List<{{ entity.id_type }}> extractIdFromRequest(APIGatewayProxyRequestEvent proxyRequestEvent) throws JsonProcessingException {
+              // Extract the ID from the request and return it
+              String[] idStr = objectMapper.readValue(proxyRequestEvent.getBody(), String[].class);
+              return {%if entity.id_type == 'String' %} Arrays.asList(idStr) {% else %}
+                Arrays.asList(idStr).stream().map(id -> {{ entity.id_type }}.get{{ entity.id_type }}(id)).toList() {% endif %};
+            }
+              
+            private APIGatewayProxyResponseEvent createSuccessResponse(String body) {
+              APIGatewayProxyResponseEvent responseEvent = new APIGatewayProxyResponseEvent();
+              responseEvent.setStatusCode(200);
+              responseEvent.setBody(body);
+              return responseEvent;
+            }
+          
+            private APIGatewayProxyResponseEvent createSuccessResponse() {
+              APIGatewayProxyResponseEvent responseEvent = new APIGatewayProxyResponseEvent();
+              responseEvent.setStatusCode(200);
+              return responseEvent;
+            }
+          }
+
+      loop: "{{ entities.CustomerCRUD }}"
+      loop_control:
+        loop_var: "entity"
+  
+        
+    - name: Exception for Repository operations
+      copy:
+        dest: "{{ lambda_work_dir }}/{{ PACKAGE_DIR }}/exception/ResourceNotFoundException.java"
+        content: |    
+          package {{ CustomerCRUD_lambda_package }}.exception;
+          
+          import org.springframework.http.HttpStatus;
+          import org.springframework.web.bind.annotation.ResponseStatus;
+          
+          @ResponseStatus(HttpStatus.NOT_FOUND)
+          public class ResourceNotFoundException extends RuntimeException {
+            public ResourceNotFoundException(String message) {
+              super(message);
+            }
+          
+            public ResourceNotFoundException(String message, Throwable cause) {
+              super(message, cause);
+            }
+          }
+
+    - name: Generate Repository classes by supplied entities.CustomerCRUD
+      copy:
+        dest: "{{ lambda_work_dir }}/{{ PACKAGE_DIR }}/repository/{{ entity.class }}Repository.java"
+        content: |        
+          package {{ CustomerCRUD_lambda_package }}.repository;
+          
+          import org.springframework.data.jpa.repository.JpaRepository;
+          import org.springframework.stereotype.Repository;
+          import java.util.Optional;
+          import {{ CustomerCRUD_lambda_package }}.model.{{ entity.class }};
+          
+          @Repository
+          public interface {{ entity.class }}Repository extends JpaRepository<{{ entity.class }}, {{ entity.id_type }}> {
+            Optional < {{ entity.class }} > findById({{ entity.id_type }} id);
+          }
+      loop: "{{ entities.CustomerCRUD }}"
+      loop_control:
+        loop_var: "entity"
+
+    - name: Generate main CRUD AWS Lambda Spring Boot class for supplied entities.CustomerCRUD
+      copy:
+        dest: "{{ lambda_work_dir }}/{{ PACKAGE_DIR }}/{{ main_class }}.java"
+        content: |        
+          package {{ CustomerCRUD_lambda_package }};
+          
+          {% for entity in entities.CustomerCRUD %}
+          import {{ CustomerCRUD_lambda_package }}.model.{{ entity.class }};
+          import {{ CustomerCRUD_lambda_package }}.repository.{{ entity.class }}Repository;
+          {% endfor %}
+          import lombok.extern.slf4j.Slf4j;
+          import org.springframework.boot.SpringApplication;
+          import org.springframework.boot.autoconfigure.SpringBootApplication;
+          import org.springframework.nativex.hint.NativeHint;
+          import org.springframework.nativex.hint.ResourceHint;
+          import org.springframework.nativex.hint.TypeAccess;
+          import org.springframework.nativex.hint.TypeHint;
+          
+          @NativeHint(
+            resources = {
+              @ResourceHint(patterns = {"org.joda.time.tz.*"})
+            }
+          )
+          // SerializationHint is required to ensure that the ObjectMapper can convert the body of the api proxy request into a DTO.
+          @TypeHint(types = { {% for entity in entities.CustomerCRUD %}{{ entity.class }}.class, {{ entity.class }}Repository.class{% if not loop.last %},{% endif %}{% endfor %} }, 
+            access = {TypeAccess.DECLARED_CONSTRUCTORS, TypeAccess.DECLARED_METHODS})
+          @SpringBootApplication
+          @Slf4j
+          public class {{ main_class }} {
+    
+            public static void main(String[] args) {
+              log.info("About to start booting");
+              SpringApplication.run({{ main_class }}.class, args);
+              log.info("Done running the {}", {{ main_class }}.class.getName());
+            }
+          }
+
+    - name: Generate bootstrap shell script
+      copy:
+        dest: "{{ lambda_work_dir }}/src/shell/native/bootstrap"
+        content: |
+          #!/bin/sh
+          set -euo pipefail
+          
+          cd ${LAMBDA_TASK_ROOT:-.}
+          
+          ./noteweb-spring-native-aws-lambda
+
+    - name: create nwpaasdsl-metadata.json file
+      copy:
+        content: "{{ nwpaasdsl_content | to_json }}"
+        dest: "{{ lambda_work_dir }}/scripts/nwpaasdsl/nwpaasdsl-metadata.json"
+      vars:
+        nwpaasdsl_content:
+          service:
+            build: "mvn -Pnative package"
+            image:
+              from: "openjdk:8-jdk-alpine"
+              entrypoint: /usr/bin/java -jar /{{ main_class }}-1.0.0.BUILD-SNAPSHOT-exec.jar
+              runtime: "target/{{ main_class }}-1.0.0.BUILD-SNAPSHOT-exec.jar"
+
+    #- name: invoke build_cmd
+    #  shell: "cd {{ lambda_work_dir }} ; mvn -Pnative package"
+    #  register: build_output

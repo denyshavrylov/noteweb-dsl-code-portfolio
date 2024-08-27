@@ -1,0 +1,941 @@
+- hosts: 127.0.0.1
+  vars:
+    SECRET_DATA: "{{ lookup('hashi_vault', 'secret={{ NW_VAULT_AWS_ACCESS_KEY_PATH | replace(\"cubbyhole\", \"cubbyhole/data\") }} url={{ NW_VAULT_URL }} token={{ NW_VAULT_TOKEN }}')  }}"
+    vault:
+      REPO_PWD: "{{ 'store_in_vault_pass' }}"
+      REPO_USER: store_in_vault_user
+      DEFAULT_DATABASE_PASS: "{{ database_password | default('store_in_vault_pass') }}"
+#    accesses: "{{ lookup('hashi_vault', 'secret=secret/nw-paas-dsl-svc token=c975b780-d1be-8016-866b-01d0f9b688a5 url=http://noteweb-vault:8200') }}"
+#set_fact: # needs to be account-specific
+      AWS_ACCESS_KEY: "{{ SECRET_DATA.data.accessKeyId }}"
+      AWS_SECRET_KEY: "{{ SECRET_DATA.data.secretKey }}"
+      AWS_REGION: "{{ AWS_REGION }}"
+
+  tasks:
+    - name: Get AWS account information
+      amazon.aws.aws_caller_info:
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+      register: account_info
+
+    - name: Display AWS account ID
+      debug:
+        var: account_info
+
+
+
+
+
+    - name: create minimal mysql instance in default VPC and default subnet group
+      community.aws.rds_instance:
+        engine: mysql
+        db_instance_identifier: "{{ instance_name | lower }}"
+        instance_type: db.t2.micro
+        allocated_storage: 9
+        password: "{{ database_password }}"
+        username: "{{ database_username }}"
+        db_name: "{{ default_database | lower }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+      register: new_db_instance
+
+    - name: register new_db_instance in the dictionary of new_cloud_elements
+      set_fact:
+        new_cloud_elements: "{{ new_cloud_elements | default({})| combine({instance_name : new_db_instance }) }}"
+
+    - name: log new_cloud_elements
+      debug:
+        msg: "new_cloud_elements={{ new_cloud_elements }}"
+
+#    - name: Install pip
+#      #apt:
+#      yum:
+#        name: python3-pip
+#        state: present
+
+    - name: Install PyMySQL
+      pip:
+        name: pymysql
+        state: present
+
+    # TODO is liquibase suited better for this task?
+    - name: Drop MySQL table(s)
+      community.mysql.mysql_query:
+        login_db: "{{ default_database | lower }}"
+        login_host: "{{ new_cloud_elements[instance_name].endpoint.address }}"
+        login_user: "{{ database_username }}"
+        login_password: "{{ database_password }}"
+        login_port: "{{ new_cloud_elements[instance_name].endpoint.port }}"
+        query: "drop table if exists {{ item.name }} "
+      loop: "{{ table_entities }}"
+
+    - name: Create MySQL table
+      community.mysql.mysql_query:
+        login_db:   "{{ default_database | lower }}"
+        login_host: "{{ new_cloud_elements[instance_name].endpoint.address }}"
+        login_user: "{{ database_username }}"
+        login_password: "{{ database_password }}"
+        login_port: "{{ new_cloud_elements[instance_name].endpoint.port }}"
+        query: "create table {{ item.name }} ( {% for field in item.fields %} {{field.name}} {{field.type}} {% if field.id is defined %} primary key {% endif %} {% if field.generated is defined %} auto_increment {% endif %} {%if not field.last %},{%endif%}{% endfor %} )"
+      loop: "{{ table_entities }}"
+
+      # ansible shell approach requires mysql client to be installed on NW PaaS DSL Service host
+    - name: run tasks to build lambda
+      include_tasks: "{{ playbook_dir }}/DriverCRUD_ensure-lambda-built.yml"
+      vars:
+        work_dir: "{{ work_dir }}"
+
+    # Create Lambda function from .jar Spring Boot
+    #- name: create java lambda (per zip-file or image?)
+    #  community.aws.lambda:
+    #    name: "{{ DriverCRUD_lambda_name }}"
+    #    state: present
+    #    zip_file: '{{ DriverCRUD_lambda_zip_file }}'
+    #    runtime: 'provided'
+    #    role: '{{ DriverCRUD_lambda_role }}'
+    #    handler: '{{ DriverCRUD_lambda_handler }}'
+    #    vpc_subnet_ids: "{{ DriverCRUD_lambda_subnet_ids }}"
+    #    vpc_security_group_ids: "{{ DriverCRUD_lambda_security_group_ids }}"
+    #    environment_variables: '{{ DriverCRUD_lambda_env_vars }}'
+    #    aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+    #    aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+    #    region: "{{ vault.AWS_REGION }}"
+    #    memory_size: 256
+    #    timeout: 5
+    #    tags: "{{ DriverCRUD_lambda_tags }}"
+
+    - name: run tasks to build lambda
+      include_tasks: "{{ playbook_dir }}/CustomerCRUD_ensure-lambda-built.yml"
+      vars:
+        work_dir: "{{ work_dir }}"
+
+    # Create Lambda function from .jar Spring Boot
+    #- name: create java lambda (per zip-file or image?)
+    #  community.aws.lambda:
+    #    name: "{{ CustomerCRUD_lambda_name }}"
+    #    state: present
+    #    zip_file: '{{ CustomerCRUD_lambda_zip_file }}'
+    #    runtime: 'provided'
+    #    role: '{{ CustomerCRUD_lambda_role }}'
+    #    handler: '{{ CustomerCRUD_lambda_handler }}'
+    #    vpc_subnet_ids: "{{ CustomerCRUD_lambda_subnet_ids }}"
+    #    vpc_security_group_ids: "{{ CustomerCRUD_lambda_security_group_ids }}"
+    #    environment_variables: '{{ CustomerCRUD_lambda_env_vars }}'
+    #    aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+    #    aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+    #    region: "{{ vault.AWS_REGION }}"
+    #    memory_size: 256
+    #    timeout: 5
+    #    tags: "{{ CustomerCRUD_lambda_tags }}"
+
+    - name: Setup AWS API Gateway and deploy API definition
+      community.aws.api_gateway:
+        #api_id: "{{ api_gateway_id }}"
+        swagger_text: |
+          swagger: '2.0'
+          info:
+            title: "{{ api_gateway_name }}"
+            version: 1.0.0
+          paths:
+            {% for resource in api_gateway_resources %}
+          /{{ resource.path }}:
+              "x-amazon-apigateway-any-method":
+                summary: "Get {{ resource.name }}"
+                responses:
+                  '200':
+                    description: Successful response
+                    schema:
+                      type: string
+                x-amazon-apigateway-integration:
+                  uri: "arn:aws:apigateway:{{ aws_region }}:lambda:path/2015-03-31/functions/arn:aws:lambda:{{ aws_region }}:{{ account_info.account }}{{ resource.arn_part }}"
+                  httpMethod: POST
+                  passthroughBehavior: "when_no_match"
+                  type: aws
+            {% endfor %}
+        stage: production
+        cache_enabled: false
+        #cache_size: '1.6'
+        tracing_enabled: true
+        endpoint_type: EDGE
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+        state: present
+      register: "DriverProfileAPI_api_gateway"
+
+#    - name: Assign policy
+#      iam_policy:
+#        name: "{{ DriverProfileAPI_api_gateway.api_id }}AccessPolicy"
+#        state: present
+#        policy_document:
+#          - |
+#            {
+#              "Version": "2012-10-17",
+#              "Statement": [
+#                {
+#                  "Effect": "Allow",
+#                  "Principal": "*",
+#                  "Action": "execute-api:Invoke",
+#                  "Resource": "arn:aws:execute-api:eu-west-1:{{ account_info.account }}:{{ DriverProfileAPI_api_gateway.api_id }}/*/*/*"
+#                }
+#              ]
+#            }
+    # Create a bucket with public policy block configuration
+    - name: setup s3 bucket
+      amazon.aws.s3_bucket:
+        name: "{{ bucket_name | lower }}"
+        state: present
+        public_access:
+          block_public_acls: true
+          ignore_public_acls: true
+          ## keys == 'false' can be omitted, undefined keys defaults to 'false'
+          block_public_policy: false
+          restrict_public_buckets: false
+        policy:
+            |
+            {
+                "Version": "2008-10-17",
+                "Id": "PolicyForCloudFrontPrivateContent",
+                "Statement": [
+                    {
+                        "Sid": "PublicReadGetObject",
+                        "Effect": "Allow",
+                        "Principal": "*",
+                        "Action": "s3:GetObject",
+                        "Resource": "arn:aws:s3:::{{ bucket_name | lower }}/*"
+                    }
+                ]
+            }
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+      register: "DriverProfileBucket_bucket"
+    - name: create a AWS Cloud Front distribution with an origin, logging and default cache behavior, backed by an S3 bucket
+      community.aws.cloudfront_distribution:
+        state: present
+        caller_reference: "{{ cdn_id }}"
+        default_root_object: index.html
+        origins:
+          - id: "{{ item.origin_id }}"
+            domain_name: "{{ item.origin_domain }}" # should point to s3, etc. aws int.urls
+            origin_path: "/{{ item.origin_path }}"
+        cache_behaviors:
+          - path_pattern: "/{{ item.path_pattern }}"
+            allowed_methods:
+              items: ['PUT', 'OPTIONS', 'POST', 'PATCH', 'DELETE', 'HEAD', 'GET']
+              cached_methods: [ 'GET', 'HEAD' ]
+            target_origin_id: "{{ item.origin_id }}"
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+    #        custom_headers:
+    #          - header_name: MyCustomHeaderName
+    #            header_value: MyCustomHeaderValue
+    #    default_cache_behavior:
+    #      target_origin_id: 'my test origin-000111'
+    #      forwarded_values:
+    #        query_string: true
+    #        cookies:
+    #          forward: all
+    #        headers:
+    #          - '*'
+    #      viewer_protocol_policy: allow-all
+    #      smooth_streaming: true
+    #      compress: true
+    #      allowed_methods:
+    #        items:
+    #          - GET
+    #          - HEAD
+    #        cached_methods:
+    #          - GET
+    #          - HEAD
+    #    logging:
+    #      enabled: true
+    #      include_cookies: false
+    #      bucket: mylogbucket.s3.amazonaws.com
+    #      prefix: "/cloud_front_{{ item.origin_id }}"
+    #    enabled: false
+        comment: Note Web UI cloud distribution
+      loop: "{{ origins }}"
+      register: "DriverProfileCDN_cdn"
+    - name: Create Route53 record for CloudFront distribution
+      community.aws.route53:
+        zone: "{{ dns_zone }}"
+        record: "{{ subdomain }}"
+        identifier: "{{ subdomain }}"
+        type: CNAME
+        overwrite: True
+        value: "{{ DriverProfileCDN_cdn.results[0].domain_name }}"
+        state: present
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+      register: route53_cdn_record
+#- hosts: 127.0.0.1
+#  vars:
+#    SECRET_DATA: "{{ lookup('hashi_vault', 'secret={{ NW_VAULT_AWS_ACCESS_KEY_PATH | replace(\"cubbyhole\", \"cubbyhole/data\") }} url={{ NW_VAULT_URL }} token={{ NW_VAULT_TOKEN }}')  }}"
+#    vault:
+#      AWS_ACCESS_KEY: "{{ SECRET_DATA.data.accessKeyId }}"
+#      AWS_SECRET_KEY: "{{ SECRET_DATA.data.secretKey }}"
+#      AWS_REGION: "{{ AWS_REGION }}"
+#  tasks:
+
+    - name: init script run
+      shell: mkdir -p {{ work_dir }}/{{ name }} ; cd {{ work_dir }}
+        
+    - name: Create new Angular app
+      command: "ng new {{ name }} --skip-install"
+      args:
+        chdir: "{{ work_dir }}"
+
+    - name: setup source code directories
+      shell: mkdir {{ work_dir }}/{{ name }}/src/service {{ work_dir }}/{{ name }}/src/model {{ work_dir }}/{{ name }}/src/app/form-document-grid {{ work_dir }}/{{ name }}/src/app/form-document-detail
+
+    - name: Generate package.json
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/package.json"
+        content: |
+          {
+            "name": "{{ name }}",
+            "version": "0.0.0",
+            "scripts": {
+              "ng": "ng",
+              "start": "ng serve",
+              "build": "ng build",
+              "watch": "ng build --watch --configuration development",
+              "test": "ng test"
+            },
+            "private": true,
+            "dependencies": {
+              "@angular/animations": "~15.2.9",
+              "@angular/elements": "~15.2.9",
+              "@angular/common": "~15.2.9",
+              "@angular/compiler": "15.2.9",
+              "@angular/core": "~15.2.9",
+              "@angular/forms": "~15.2.9",
+              "@angular/platform-browser": "~15.2.9",
+              "@angular/platform-browser-dynamic": "~15.2.9",
+              "@angular/router": "~15.2.9",
+              "@formio/angular": "5.5.0-rc.9",
+              "formiojs": "^4.14.9",
+              "ngx-toastr": "^16.2.0",
+              "rxjs": "~7.8.0",
+              "tslib": "^2.3.0",
+              "zone.js": "^0.12.0"
+            },
+            "devDependencies": {
+              "@angular-devkit/build-angular": "15.2.8",
+              "@angular/cli": "~15.2.8",
+              "@angular/compiler-cli": "15.2.9",
+              "@types/jasmine": "~4.3.0",
+              "jasmine-core": "~4.5.0",
+              "karma": "~6.4.0",
+              "karma-chrome-launcher": "~3.1.0",
+              "karma-coverage": "~2.2.0",
+              "karma-jasmine": "~5.1.0",
+              "karma-jasmine-html-reporter": "~2.0.0",
+              "typescript": "~4.8.2"
+            }
+          }
+
+    - name: Generate <FormDefinition>Service(s) class(es)
+      loop: "{{ ui_entities }}"
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/service/{{ item.name | lower }}-form-definition.service.ts"
+        content: |
+          import { Injectable } from '@angular/core';
+          import { {{ item.name }} } from '../model/{{ item.name | lower }}';
+
+          @Injectable({
+            providedIn: 'root'
+          })
+          export class {{ item.name }}FormDefinitionService {
+            private formDefinition = {
+              id: '{{ item.name }}FormDefinition',
+              components: [
+                {% for field in item.fields %}
+                {
+                  type: 'textfield',
+                  key: '{{ field.name  }}',
+                  label: '{{ field.name | regex_replace('([a-z0-9])([A-Z])', '\1 \2') | title }}'
+                }{% if not loop.last %},{% endif %}
+                {% endfor %}
+              ]
+            };
+
+            constructor() {}
+
+            getFormDefinition() {
+              return this.formDefinition;
+            }
+
+            getFormGrid() {
+                // transform passed form definition to render in grid and only supplied columns!
+                return {
+                  components: [
+                    {
+                      label: '{{ item.name }} Grid View',
+                      type: 'datagrid',
+                      input: true,
+                      components: this.getFormDefinition().components
+                    }
+                  ]
+                }
+            }
+          }
+
+    - name: Generate <FormDocument>Service(s) class(es)
+      loop: "{{ ui_entities }}"
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/service/{{ item.name | lower }}.service.ts"
+        content: |
+          import { Injectable } from '@angular/core';
+          import { HttpClient } from '@angular/common/http';
+          import { Observable } from 'rxjs';
+          import { map } from 'rxjs/operators';
+          import { {{ item.name }} } from 'src/model/{{ item.name | lower }}';
+
+          interface FormDocumentResponse {
+            isBase64Encoded: null | boolean;
+            headers: null | Record<string, string>;
+            body: string;
+            statusCode: number;
+            multiValueHeaders: null | Record<string, string[]>;
+          }
+
+          @Injectable({
+            providedIn: 'root'
+          })
+          export class {{ item.name }}Service {
+            private url: string = 'https://{{ item.backendUrl }}';
+
+            constructor(private http: HttpClient) {}
+
+            getFormDocuments(): Observable<{{ item.name }}[]> {
+              return this.http.post<FormDocumentResponse>(this.url, { body: '{}', httpMethod: 'GET' })
+                .pipe(map((resp: FormDocumentResponse) => JSON.parse(resp.body) as {{ item.name }}[]));
+            }
+          
+            createFormDocuments(documents: {{ item.name }}[]): Observable<{{ item.name }}[]> {
+              const requestBody = { body: JSON.stringify(documents), httpMethod: 'POST' };
+              return this.http.post<any>(this.url, requestBody);
+            }
+            
+            updateFormDocuments(documents: {{ item.name }}[]): Observable<{{ item.name }}[]> {
+              const requestBody = { body: JSON.stringify(documents), httpMethod: 'PUT' };
+              return this.http.post<any>(this.url, requestBody);
+            }
+            
+            deleteFormDocuments(documents: {{ item.name }}[]): Observable<{{ item.name }}[]> {
+              const documentIds = documents.map((doc: {{ item.name }}) => 
+                                          this.escapeId(doc.{{ item.id_field }}.toString())).join(';');
+              const body = JSON.stringify({ documentIds });
+              const payload = { body, httpMethod: 'DELETE' };
+              return this.http.post<any>(this.url, payload);
+            }
+            
+            private escapeId(id: string): string {
+              return id.replace(';', '\\;');
+            }
+          }
+
+    - name: Generate <FormDocument>GridComponent(s) class(es)
+      loop: "{{ ui_entities }}"
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/form-document-grid/{{ item.name | lower }}-form-document-grid.component.ts"
+        content: |
+          import { Component, Input, OnInit } from '@angular/core';
+          import { {{ item.name }}FormDefinitionService } from 'src/service/{{ item.name | lower }}-form-definition.service';
+          import { {{ item.name }}Service } from 'src/service/{{ item.name | lower }}.service';
+          import { {{ item.name }} } from 'src/model/{{ item.name | lower }}';
+          import { FormioGrid } from '@formio/angular/grid';
+          import { ToastrService } from 'ngx-toastr';
+          import { ChangeStatus, Changeable, DocumentContainer } from 'src/model/document-container';
+          
+          const { Unchanged, Added, Updated, Deleted } = ChangeStatus;
+          
+          @Component({
+            selector: '{{ item.name | lower }}-form-document-grid',
+            templateUrl: './form-document-grid.component.html',
+            styleUrls: ['./form-document-grid.component.css'],
+            providers: [{{ item.name }}Service, {{ item.name }}FormDefinitionService]
+          })
+          export class {{ item.name }}GridComponent implements OnInit {
+            grid: any;
+            originalDocuments: Map<string, Driver> = new Map<string, Driver>();
+            _internalIds: Map<string, Driver> = new Map<string, Driver>();
+            @Input() documents: DocumentContainer<Driver> = {  data: {dataGrid: []}  };
+          
+            constructor(
+              private formDocumentService: {{ item.name }}Service,
+              private formDefinitionService: {{ item.name }}FormDefinitionService,
+              private toastr: ToastrService
+            ){}
+          
+            ngOnInit(): void {
+              this.grid = this.formDefinitionService.getFormGrid()
+              this.formDocumentService.getFormDocuments().subscribe(docs => {
+                // Assign documents with change status tracking properties
+                docs.forEach((doc: Driver) => {
+                  const internalId = this.generateInternalId();
+                  this._internalIds.set(internalId, doc)
+                  this.originalDocuments.set(internalId, {...doc});          
+                });
+                this.documents = {
+                  data: {
+                    dataGrid: docs
+                  }
+                };
+                console.log("Obtained grid definition: ", this.grid, ", documents=",
+                      this.documents, ", originalDocs=", this.originalDocuments, "internalIds=", this._internalIds);
+              });
+            }
+          
+            saveChanges(): void {
+              console.log("Analyzing loaded documents for changes");
+              const modifiedDocuments: Changeable<Driver>[] = this.compareToOriginal(this.documents.data.dataGrid, this._internalIds, this.originalDocuments);
+              const addedDocuments = modifiedDocuments.filter((doc: Changeable<Driver>) => doc.changeStatus === Added);
+              const updatedDocuments = modifiedDocuments.filter((doc: Changeable<Driver>) => doc.changeStatus === Updated);
+              const deletedDocuments = modifiedDocuments.filter((doc: Changeable<Driver>) => doc.changeStatus === Deleted);
+            
+              if (addedDocuments.length > 0) {
+                this.formDocumentService.createFormDocuments(addedDocuments.map(d => d.entry)).subscribe(
+                  (response) => {
+                    // Handle success
+                    this.toastr.success('Created ' + addedDocuments.length + ' form document(s)');
+                    addedDocuments.forEach((doc: Changeable<Driver>) => this.originalDocuments.set(doc._internalId, {...doc.entry}))
+                  },
+                  (error) => {
+                    // Handle error
+                    this.toastr.error('Error creating form documents: ' + error);
+                    console.error('Error creating documents:', error);
+                  }
+                );
+              }
+            
+              if (updatedDocuments.length > 0) {
+                this.formDocumentService.updateFormDocuments(updatedDocuments.map(d => d.entry)).subscribe(
+                  (response) => {
+                    updatedDocuments.forEach((doc: Changeable<Driver>) => this.originalDocuments.set(doc._internalId, {...doc.entry}))
+                    // Handle success
+                    this.toastr.success('Updated ' + updatedDocuments.length + ' form document(s)');
+                    console.log('Updated documents:', response);
+                  },
+                  (error) => {
+                    // Handle error
+                    this.toastr.error('Error updating form documents');
+                    console.error('Error updating documents:', error);
+                  }
+                );
+              }
+            
+              if (deletedDocuments.length > 0) {
+                this.formDocumentService.deleteFormDocuments(deletedDocuments.map(d => d.entry)).subscribe(
+                  (response) => {
+                    // Handle success
+                    deletedDocuments.forEach((doc: Changeable<Driver>) => this.originalDocuments.delete(doc._internalId))
+                    this.toastr.success('Deleted ' + deletedDocuments.length + ' form document(s)');
+                    console.log('Deleted documents:', response);
+                  },
+                  (error) => {
+                    // Handle error
+                      this.toastr.error('Error deleting form documents: ' + error);
+                            console.error('Error updating documents:', error);
+                });
+              }
+              console.log("Done applying changes");
+            }
+                    
+            compareToOriginal(docs: Driver[], documents: Map<string, Driver>, originalDocuments: Map<string, Driver>): Changeable<Driver>[] {
+              const result: Changeable<Driver>[] = [];            
+              // Check for updated or deleted entries
+              for (const originalDocInternalId of originalDocuments.keys()) {
+              const originalDoc = originalDocuments.get(originalDocInternalId);
+              const curDoc = documents.get(originalDocInternalId);
+              const matchedDoc = curDoc ? (docs.includes(curDoc) ? curDoc : null) : null;
+              console.log("originalDocInternalId=", originalDocInternalId, ", comparing matchedDoc:\n", matchedDoc, 
+                "\noriginalDoc:\n", originalDoc, "\nequal=", matchedDoc && this.isEqual(matchedDoc, originalDoc));
+              if (!matchedDoc && originalDoc) {
+                console.log("doc=", originalDoc, " was deleted");
+                result.push({ entry: originalDoc, changeStatus: Deleted, _internalId: originalDocInternalId });
+              } else if (matchedDoc && !this.isEqual(originalDoc, matchedDoc)) {
+                result.push({ entry: matchedDoc, changeStatus: Updated, _internalId: originalDocInternalId });
+              }
+            }
+            
+            // Check for added entries
+            for (const doc of docs) {
+              const docPresent = Array.from(documents.values()).includes(doc);
+              console.log("doc=", doc, ", matchedOriginalDoc=", docPresent);
+              if (!docPresent) {
+                result.push({ entry: doc, changeStatus: Added, _internalId: this.generateInternalId() });
+              }
+            }
+            
+            return result;
+            }
+            
+            private generateInternalId(): string {
+              // Generate a random internal ID
+              return Math.random().toString(36).substring(5);
+            }
+            
+            private isEqual(obj1: any, obj2: any): boolean {
+              // Perform deep property-wise comparison between objects
+              const str1: string = JSON.stringify(this.sortObjectKeys(obj1), this.nullBlanker) ;
+              const str2: string = JSON.stringify(this.sortObjectKeys(obj2), this.nullBlanker);
+              return str1 === str2;
+            }
+            
+            nullBlanker = (key: string, value: Object) => (value === null || value === '') ? undefined : value;
+            
+            private sortObjectKeys(obj: any): any {
+              const sortedKeys = Object.keys(obj).sort();
+              return sortedKeys.reduce((sortedObj:{ [key: string]: any }, key) => {
+                sortedObj[key] = obj[key];
+                return sortedObj;
+              }, {});
+            }
+
+          }
+
+
+    - name: Generate <FormDocument>DetailComponent HTML
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/form-document-grid/form-document-grid.component.html"
+        content: |
+          <div>
+          <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/font-awesome/4.7.0/css/font-awesome.min.css">
+          <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.1.3/css/bootstrap.min.css">
+          <link rel="stylesheet" href="https://cdn.form.io/formiojs/formio.full.min.css">
+          <formio [form]="grid" [submission]="documents" ></formio>
+          <button (click)="saveChanges()">Save</button>
+          </div>
+
+    - name: Generate <FormDocument>DetailComponent(s) class(es)
+      loop: "{{ ui_entities }}"
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/form-document-detail/{{ item.name | lower }}-form-document-detail.component.ts"
+        content: |          
+          import { Component, Input, OnInit } from '@angular/core';
+          import { {{ item.name }} } from 'src/model/{{ item.name | lower }}';
+          import { Changeable, ChangeStatus } from 'src/model/document-container';
+          import { {{ item.name }}FormDefinitionService } from 'src/service/{{ item.name | lower }}-form-definition.service';
+          
+          @Component({
+            selector: '{{ item.name | lower }}-form-document-detail',
+            templateUrl: './form-document-detail.component.html',
+            styleUrls: ['./form-document-detail.component.css']
+          })
+          export class {{ item.name }}DetailComponent implements OnInit  {
+            @Input() document: Changeable<{{ item.name }}> | null = null;
+            form: any;
+            constructor(private formDefinitionService: {{ item.name }}FormDefinitionService){}
+            
+            formioOptions = {
+              noAlerts: true
+            };
+                
+            ngOnInit() {
+              this.form = this.formDefinitionService.getFormDefinition();
+            }
+          }
+
+    - name: Generate FormDocumentDetailComponent HTML
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/form-document-detail/form-document-detail.component.html"
+        content: |
+          <div *ngIf="document">
+            <formio [form]="form" [submission]="document"></formio>
+          </div>
+
+    - name: Generate app.component class
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/app.component.ts"
+        content: |          
+          import { Component, OnInit, HostListener } from '@angular/core';
+          {% for entity in ui_entities %}
+          import { {{ entity.name }}Service } from '../service/{{ entity.name | lower }}.service';
+          import { {{ entity.name }}FormDefinitionService } from '../service/{{ entity.name | lower }}-form-definition.service';
+          import { {{ entity.name }} } from '../model/{{ entity.name | lower }}';          
+          {% endfor %}
+          import { Changeable, DocumentContainer } from '../model/document-container';
+          
+          @Component({
+            selector: 'app-root',
+            templateUrl: './app.component.html',
+            styleUrls: ['./app.component.css'],
+            providers: [{% for entity in ui_entities %}{{ entity.name }}Service, {{ entity.name }}FormDefinitionService{% if not loop.last %},{% endif %}{% endfor %}]
+          })
+          export class AppComponent implements OnInit {
+            {% for entity in ui_entities %}{{ entity.name | lower }}Documents: DocumentContainer<{{ entity.name }}> =  { data: { dataGrid: [] } };
+            {{ entity.name | lower }}SelectedDocument: any;
+            {% endfor %}
+            selectedLayout = 'list-details';
+            title = 'nw-app-sample';
+          
+            constructor(
+            {% for entity in ui_entities %}
+              //private formDocumentService: {{ entity.name }}Service,
+              //private formDefinitionService: {{ entity.name }}FormDefinitionService{% if not loop.last %}, {% endif %}
+            {% endfor %}
+            
+            ) { }
+            
+            ngOnInit() {
+            // Initialize documents
+            //this.documents = this.formDocumentService.getFormDocuments();
+            }
+            
+            @HostListener('window:resize', ['$event'])
+            onResize(/*event*/) {
+              this.setLayout();
+            }
+            
+            get isCompact(): boolean {
+              return window.innerWidth < 640;
+            }
+            
+            get isMedium(): boolean {
+              return window.innerWidth >= 640 && window.innerWidth < 840;
+            }
+            
+            get isExpanded(): boolean {
+              return window.innerWidth >= 840;
+            }
+          
+            setLayout() {
+              console.log("Updating layout")
+            }
+          }
+
+
+    - name: Generate app.component HTML template
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/app.component.html"
+        content: |
+          {% for entity in ui_entities %}
+          <div *ngIf="selectedLayout === 'list-details'">
+            <div class="layout-container" [ngClass]="{'compact': isCompact, 'medium': isMedium, 'expanded': isExpanded}">
+              <div class="grid-section">
+                <{{ entity.name | lower }}-form-document-grid [documents]="{{ entity.name | lower }}Documents" (selectedDocument)="{{ entity.name | lower }}SelectedDocument = $event"></{{ entity.name | lower }}-form-document-grid>
+              </div>
+              <div class="detail-section">
+                <{{ entity.name | lower }}-form-document-detail [document]="{{ entity.name | lower }}SelectedDocument"></{{ entity.name | lower }}-form-document-detail>
+              </div>
+            </div>
+          </div>
+          <!--<div *ngIf="selectedLayout === 'supporting-pane'">
+            <div class="layout-container" [ngClass]="{'compact': isCompact, 'medium': isMedium, 'expanded': isExpanded}">
+              <div class="grid-section">
+                <{{ entity.name | lower }}-form-document-grid [documents]="documents" (selectedDocument)="selectedDocument = $event"></{{ entity.name | lower }}-form-document-grid>
+              </div>
+              <div class="detail-section">
+                <{{ entity.name | lower }}-form-document-detail [document]="selectedDocument"></{{ entity.name | lower }}-form-document-detail>
+              </div>
+            </div>
+          </div>
+          <div *ngIf="selectedLayout === 'feed'">
+            <div class="layout-container" [ngClass]="{'compact': isCompact, 'medium': isMedium, 'expanded': isExpanded}">
+              <div class="detail-section">
+                <{{ entity.name | lower }}-form-document-grid [documents]="documents"></{{ entity.name | lower }}-form-document-grid>
+              </div>
+            </div>
+          </div>
+          {% endfor %}
+          <div class="layout-selector">
+            <label>Select Layout:</label>
+            <select [(ngModel)]="selectedLayout">
+              <option value="list-details">List Details</option>
+              <option value="supporting-pane">Supporting Pane</option>
+              <option value="feed">Feed</option>
+            </select>
+          </div>-->
+
+    - name: Generate app.component CSS
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/app.component.css"
+        content: |          
+          .layout-container {
+              display: flex;
+              flex-direction: row;
+          }
+            .grid-section {
+            flex: 1;
+          }
+            .detail-section {
+            flex: 2;
+          }
+
+
+    - name: Generate form-document-grid.component CSS
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/form-document-grid/form-document-grid.component.css"
+        content: |
+
+    - name: Generate form-document-detail.component CSS
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/form-document-detail/form-document-detail.component.css"
+        content: |
+
+    - name: Generate NW App module
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/app/app.module.ts"
+        content: |
+          import { NgModule } from '@angular/core';
+          import {FormsModule} from '@angular/forms';
+          import { BrowserModule } from '@angular/platform-browser';
+          import { FormioModule} from '@formio/angular';
+          import { HttpClientModule } from '@angular/common/http';
+          import { CommonModule } from '@angular/common';
+          import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
+          import { ToastrModule } from 'ngx-toastr';
+
+          import { AppComponent } from './app.component';
+          {% for entity in ui_entities %}
+          import { {{ entity.name }}DetailComponent } from './form-document-detail/{{ entity.name | lower }}-form-document-detail.component';
+          import { {{ entity.name }}GridComponent } from './form-document-grid/{{ entity.name | lower }}-form-document-grid.component';
+          {% endfor %}
+
+          @NgModule({
+            declarations: [
+              AppComponent,
+              {% for entity in ui_entities %}
+                {{ entity.name }}DetailComponent,
+                {{ entity.name }}GridComponent{% if not loop.last %},{% endif %}
+              {% endfor %}
+            ],
+            imports: [
+              BrowserModule, FormsModule, FormioModule, HttpClientModule,
+              CommonModule,
+              BrowserAnimationsModule, // required animations module
+              ToastrModule.forRoot()
+            ],
+            providers: [],
+            bootstrap: [AppComponent]
+          })
+          export class AppModule { }
+
+    - name: Generate model classes by supplied ui_entities
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/model/{{ item.name | lower }}.ts"
+        content: |
+          export interface {{ item.name }} {
+            {% for field in item.fields %}
+                {{ field.name }}: {{ field.type }}; 
+            {% endfor %}
+          }
+      loop: "{{ ui_entities }}"
+
+    - name: document change tracking classes
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/model/document-container.ts"
+        content: |
+          export enum ChangeStatus {
+            Unchanged = 'unchanged',
+            Added = 'added',
+            Updated = 'updated',
+            Deleted = 'deleted'
+          }
+            
+          export type Changeable<T> = {
+            entry: T
+            changeStatus: ChangeStatus;
+            _internalId: string;
+          };
+            
+          export type DocumentContainer<T> = {
+            data: { dataGrid: T[] }
+          }
+
+    - name: Some test data - trips
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/assets/trips.json"
+        content: |
+          [
+            {
+              "dateStart": "2023.01.01 09:00:00",
+              "dateFinish": "2023.01.01 09:09:00",
+              "startPoint": "Test origin",
+              "finishPoint": "Test target",
+              "vehicle": "Test vehicle",
+              "driver": "Test TEst",
+              "client": "Client"
+            },
+            {
+              "dateStart": "2023.01.01 09:00:00",
+              "dateFinish": "2023.01.01 09:09:00",
+              "startPoint": "Test origin P",
+              "finishPoint": "Test target U",
+              "vehicle": "Test vehicle Q",
+              "driver": "Test TEst V",
+              "client": "Client V"
+            }
+          ]
+
+    - name: Some test data - vehicles
+      copy:
+        dest: "{{ work_dir }}/{{ name }}/src/assets/vehicles.json"
+        content: |
+          [
+            {
+              "licenseNumber": "BB 90-90 PP"
+            },
+            {
+              "licenseNumber": "XX 90-90 EE"
+            }
+          ]
+
+    - name: Install NW Context App libs
+      command: npm install
+      args:
+        chdir: "{{ work_dir }}/{{ name }}"
+
+    - name: Fix formio lib
+      copy:
+        src: "{{ playbook_dir}}/formio.common.d.ts"
+        dest: "{{ work_dir }}/{{ name }}/node_modules/@formio/angular/formio.common.d.ts"
+
+    - name: Fix build size
+      ansible.builtin.replace:
+        path: "{{ work_dir }}/{{ name }}/angular.json"
+        #regexp: '("projects":\s*{\s*"{{ name }}":\s*{\s*"architect":\s*{\s*"build":\s*{\s*"configurations":\s*{\s*"production":\s*{\s*"budgets":\s*\[\s*{\s*"type":\s*"initial"\s*,"maximumError":\s*")(\d+\.*\d*mb)(")'
+        #replace: '\1\\5mb\3'
+        regexp: '"maximumError": "1mb"'
+        replace: '"maximumError": "5mb"'
+
+    - name: Build NW Context App
+      command: npm run build
+      args:
+        chdir: "{{ work_dir }}/{{ name }}"
+
+    - name: Copy Angular app build artifacts to S3 bucket
+      community.aws.s3_sync:
+        bucket: "{{ bucket_id | lower }}"
+        file_root: "{{ work_dir }}/{{ name }}/dist/"
+        #key_prefix: "/{{ name }}"
+        mode: push
+        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+        region: "{{ vault.AWS_REGION }}"
+      register: "app_deploy_result"
+
+#    - name: Invalidate CloudFront cache
+#      aws_cloudfront_invalidation:
+#        distribution_id: your-cloudfront-distribution-id
+#        paths:
+#          - "/*"
+#        state: present
+#        aws_access_key: "{{ vault.AWS_ACCESS_KEY }}"
+#        aws_secret_key: "{{ vault.AWS_SECRET_KEY }}"
+#        region: "{{ vault.AWS_REGION }}"
+#      register: cloudfront_invalidation_result
+
+    - name: Show deployment summary
+      debug:
+        msg: |
+          Deployment summary:
+          S3 Copy Result: {{ app_deploy_result }}
+#          CloudFront Invalidation Result: {{ cloudfront_invalidation_result }}
+

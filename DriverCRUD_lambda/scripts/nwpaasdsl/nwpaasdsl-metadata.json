@@ -1,0 +1,1 @@
+{"service": {"build": "mvn -Pnative package", "image": {"from": "openjdk:8-jdk-alpine", "entrypoint": "/usr/bin/java -jar /DriverCrudAwsLambdaApplication-1.0.0.BUILD-SNAPSHOT-exec.jar", "runtime": "target/DriverCrudAwsLambdaApplication-1.0.0.BUILD-SNAPSHOT-exec.jar"}}}

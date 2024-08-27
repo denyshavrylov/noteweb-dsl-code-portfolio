@@ -1,0 +1,10 @@
+.layout-container {
+    display: flex;
+    flex-direction: row;
+}
+  .grid-section {
+  flex: 1;
+}
+  .detail-section {
+  flex: 2;
+}

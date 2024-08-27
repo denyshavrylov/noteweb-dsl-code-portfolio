@@ -1,0 +1,35 @@
+<div *ngIf="selectedLayout === 'list-details'">
+  <div class="layout-container" [ngClass]="{'compact': isCompact, 'medium': isMedium, 'expanded': isExpanded}">
+    <div class="grid-section">
+      <driver-form-document-grid [documents]="driverDocuments" (selectedDocument)="driverSelectedDocument = $event"></driver-form-document-grid>
+    </div>
+    <div class="detail-section">
+      <driver-form-document-detail [document]="driverSelectedDocument"></driver-form-document-detail>
+    </div>
+  </div>
+</div>
+<!--<div *ngIf="selectedLayout === 'supporting-pane'">
+  <div class="layout-container" [ngClass]="{'compact': isCompact, 'medium': isMedium, 'expanded': isExpanded}">
+    <div class="grid-section">
+      <driver-form-document-grid [documents]="documents" (selectedDocument)="selectedDocument = $event"></driver-form-document-grid>
+    </div>
+    <div class="detail-section">
+      <driver-form-document-detail [document]="selectedDocument"></driver-form-document-detail>
+    </div>
+  </div>
+</div>
+<div *ngIf="selectedLayout === 'feed'">
+  <div class="layout-container" [ngClass]="{'compact': isCompact, 'medium': isMedium, 'expanded': isExpanded}">
+    <div class="detail-section">
+      <driver-form-document-grid [documents]="documents"></driver-form-document-grid>
+    </div>
+  </div>
+</div>
+<div class="layout-selector">
+  <label>Select Layout:</label>
+  <select [(ngModel)]="selectedLayout">
+    <option value="list-details">List Details</option>
+    <option value="supporting-pane">Supporting Pane</option>
+    <option value="feed">Feed</option>
+  </select>
+</div>-->
