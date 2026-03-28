@@ -17,14 +17,18 @@ router.get('/', async (req: Request, res: Response) => {
 // Retrieve a single Product
 router.get('/:id', async (req: Request, res: Response) => {
   const id = req.params.id;
+  console.log(`[GET /products/${id}] Fetching product by id: ${id}`);
   try {
     const product = await ProductRepository.findByPk(id);
     if (product) {
+      console.log(`[GET /products/${id}] Product found:`, JSON.stringify(product));
       res.status(200).json({ data: product });
     } else {
+      console.log(`[GET /products/${id}] Product not found for id: ${id}`);
       res.status(404).json({ message: 'Product not found' });
     }
   } catch (err: any) {
+    console.error(`[GET /products/${id}] Error fetching product by id: ${id}`, err);
     handleError(err, res);
   }
 });
